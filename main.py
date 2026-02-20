@@ -1,23 +1,19 @@
-import json
-import sqlite3
-import time
-from typing import List
-
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPException
+import uvicorn
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer
-from jose import jwt, JWTError
-from passlib.context import CryptContext
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+import jwt, time, os, json, asyncio, base64
 
-# =============================
-# 基础配置
-# =============================
-
-SECRET_KEY = "CHANGE_THIS_SECRET"
-ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_SECONDS = 60 * 60 * 24
-
+# ===============================
+# 配置
+# ===============================
 app = FastAPI()
+SECRET_KEY = "请替换成超长随机密钥"
+ACCESS_TOKEN_EXPIRE = 3600
+ADMIN_USERS = ["admin"]
+os.makedirs("uploads", exist_ok=True)
 
 app.add_middleware(
     CORSMiddleware,
@@ -27,181 +23,156 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
+# 静态文件支持 Web 前端
+app.mount("/", StaticFiles(directory="static", html=True), name="static")
 
-# =============================
-# 数据库
-# =============================
+# ===============================
+# 模拟数据库
+# ===============================
+USERS = {}           # username -> password
+FRIENDS = {}         # username -> [friend_usernames]
+ONLINE = {}          # username -> websocket
+USER_UPLOADS = {}    # username -> [filename]
 
-conn = sqlite3.connect("chat.db", check_same_thread=False)
-cursor = conn.cursor()
-
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    username TEXT UNIQUE,
-    password TEXT,
-    is_admin INTEGER DEFAULT 0
-)
-""")
-
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS friends (
-    user TEXT,
-    friend TEXT
-)
-""")
-
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS messages (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    sender TEXT,
-    receiver TEXT,
-    content TEXT,
-    timestamp INTEGER
-)
-""")
-
-conn.commit()
-
-# =============================
+# ===============================
 # JWT
-# =============================
+# ===============================
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
 def create_token(username: str):
-    expire = int(time.time()) + ACCESS_TOKEN_EXPIRE_SECONDS
-    payload = {"sub": username, "exp": expire}
-    return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+    payload = {"sub": username, "exp": time.time() + ACCESS_TOKEN_EXPIRE}
+    return jwt.encode(payload, SECRET_KEY, algorithm="HS256")
 
 def verify_token(token: str):
     try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        return payload.get("sub")
-    except JWTError:
-        raise HTTPException(status_code=401, detail="Invalid token")
+        payload = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
+        return payload["sub"]
+    except:
+        return None
 
 def get_current_user(token: str = Depends(oauth2_scheme)):
-    return verify_token(token)
+    user = verify_token(token)
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    return user
 
-# =============================
-# 注册
-# =============================
+# ===============================
+# 数据模型
+# ===============================
+class User(BaseModel):
+    username: str
+    password: str
 
+# ===============================
+# HTTP 接口
+# ===============================
 @app.post("/register")
-def register(username: str, password: str):
-    hashed = pwd_context.hash(password)
-    try:
-        cursor.execute(
-            "INSERT INTO users (username, password) VALUES (?, ?)",
-            (username, hashed)
-        )
-        conn.commit()
-        return {"status": "ok"}
-    except:
-        raise HTTPException(status_code=400, detail="User exists")
-
-# =============================
-# 登录
-# =============================
+def register(user: User):
+    if user.username in USERS:
+        return {"error": "用户已存在"}
+    USERS[user.username] = user.password
+    FRIENDS[user.username] = []
+    USER_UPLOADS[user.username] = []
+    return {"msg": "注册成功"}
 
 @app.post("/login")
-def login(username: str, password: str):
-    cursor.execute("SELECT password FROM users WHERE username=?", (username,))
-    row = cursor.fetchone()
-    if not row:
-        raise HTTPException(status_code=400, detail="User not found")
-
-    if not pwd_context.verify(password, row[0]):
-        raise HTTPException(status_code=400, detail="Wrong password")
-
-    token = create_token(username)
-    return {"access_token": token, "token_type": "bearer"}
-
-# =============================
-# 添加好友
-# =============================
-
-@app.post("/add_friend")
-def add_friend(friend: str, user: str = Depends(get_current_user)):
-    cursor.execute("INSERT INTO friends (user, friend) VALUES (?, ?)", (user, friend))
-    conn.commit()
-    return {"status": "added"}
-
-# =============================
-# 获取好友列表
-# =============================
+def login(user: User):
+    if USERS.get(user.username) != user.password:
+        raise HTTPException(401, "用户名或密码错误")
+    token = create_token(user.username)
+    return {"access_token": token}
 
 @app.get("/friends")
-def get_friends(user: str = Depends(get_current_user)):
-    cursor.execute("SELECT friend FROM friends WHERE user=?", (user,))
-    rows = cursor.fetchall()
-    return {"friends": [r[0] for r in rows]}
+def get_friends(current_user: str = Depends(get_current_user)):
+    return {"friends": FRIENDS.get(current_user, [])}
 
-# =============================
-# 消息历史
-# =============================
+@app.post("/add_friend")
+def add_friend(friend: str, current_user: str = Depends(get_current_user)):
+    if friend not in USERS:
+        raise HTTPException(404, "好友不存在")
+    if friend not in FRIENDS[current_user]:
+        FRIENDS[current_user].append(friend)
+    if current_user not in FRIENDS[friend]:
+        FRIENDS[friend].append(current_user)
+    return {"msg": "添加成功"}
 
-@app.get("/history/{other}")
-def get_history(other: str, user: str = Depends(get_current_user)):
-    cursor.execute("""
-        SELECT sender, receiver, content, timestamp
-        FROM messages
-        WHERE (sender=? AND receiver=?)
-           OR (sender=? AND receiver=?)
-        ORDER BY timestamp ASC
-    """, (user, other, other, user))
-    rows = cursor.fetchall()
-    return {"messages": rows}
+# ===============================
+# 管理员接口
+# ===============================
+@app.get("/admin/users")
+def admin_users(current_user: str = Depends(get_current_user)):
+    if current_user not in ADMIN_USERS:
+        raise HTTPException(403, "不是管理员")
+    return {"users": list(ONLINE.keys())}
 
-# =============================
-# WebSocket
-# =============================
+@app.post("/admin/kick")
+def admin_kick(user: str, current_user: str = Depends(get_current_user)):
+    if current_user not in ADMIN_USERS:
+        raise HTTPException(403, "不是管理员")
+    ws = ONLINE.get(user)
+    if ws:
+        asyncio.create_task(ws.close())
+        return {"msg": f"{user} 已被踢出"}
+    return {"msg": "用户不在线"}
 
-active_connections = {}
+@app.post("/admin/broadcast")
+def admin_broadcast(message: str, current_user: str = Depends(get_current_user)):
+    if current_user not in ADMIN_USERS:
+        raise HTTPException(403, "不是管理员")
+    for ws in ONLINE.values():
+        asyncio.create_task(ws.send_json({"from": "管理员", "content": message}))
+    return {"msg": "广播完成"}
 
+# ===============================
+# 上传文件接口
+# ===============================
+@app.post("/upload")
+async def upload_file(file: UploadFile = File(...), current_user: str = Depends(get_current_user)):
+    save_path = f"uploads/{current_user}_{int(time.time())}_{file.filename}"
+    content = await file.read()
+    with open(save_path, "wb") as f:
+        f.write(content)
+    USER_UPLOADS[current_user].append(save_path)
+    return {"msg": "上传成功", "filename": save_path}
+
+@app.get("/uploads/{username}")
+def list_uploads(username: str, current_user: str = Depends(get_current_user)):
+    return {"files": USER_UPLOADS.get(username, [])}
+
+# ===============================
+# WebSocket 聊天（消息/文件/语音）
+# ===============================
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket, token: str):
     username = verify_token(token)
+    if not username:
+        await websocket.close()
+        return
     await websocket.accept()
-    active_connections[username] = websocket
-
+    ONLINE[username] = websocket
     try:
         while True:
             data = await websocket.receive_text()
             msg = json.loads(data)
-
-            receiver = msg["to"]
-            content = msg["content"]
-
-            timestamp = int(time.time())
-
-            cursor.execute(
-                "INSERT INTO messages (sender, receiver, content, timestamp) VALUES (?, ?, ?, ?)",
-                (username, receiver, content, timestamp)
-            )
-            conn.commit()
-
-            if receiver in active_connections:
-                await active_connections[receiver].send_text(json.dumps({
-                    "from": username,
-                    "content": content,
-                    "timestamp": timestamp
-                }))
-
+            to_user = msg.get("to")
+            if not to_user:
+                continue
+            if to_user in ONLINE:
+                try:
+                    await ONLINE[to_user].send_text(json.dumps(msg))
+                except:
+                    pass
+            if "file" in msg:
+                file_data = base64.b64decode(msg["content"])
+                save_path = f"uploads/{to_user}_{int(time.time())}_{msg['file']}"
+                with open(save_path, "wb") as f:
+                    f.write(file_data)
+                USER_UPLOADS[to_user].append(save_path)
+            if "voice" in msg:
+                voice_data = base64.b64decode(msg["voice"])
+                save_path = f"uploads/{to_user}_voice_{int(time.time())}.raw"
+                with open(save_path, "wb") as f:
+                    f.write(voice_data)
+                USER_UPLOADS[to_user].append(save_path)
     except WebSocketDisconnect:
-        active_connections.pop(username, None)
-
-# =============================
-# 管理员接口
-# =============================
-
-@app.get("/admin/users")
-def list_users(user: str = Depends(get_current_user)):
-    cursor.execute("SELECT is_admin FROM users WHERE username=?", (user,))
-    row = cursor.fetchone()
-    if not row or row[0] != 1:
-        raise HTTPException(status_code=403, detail="Not admin")
-
-    cursor.execute("SELECT username FROM users")
-    return {"users": [u[0] for u in cursor.fetchall()]}
+        ONLINE.pop(username, None)
